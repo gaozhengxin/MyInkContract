@@ -1,9 +1,22 @@
 #![cfg_attr(not(feature = "std"), no_std, no_main)]
 
 #[ink::contract]
-mod erc20 {
-    use ink::storage::Mapping;
+mod erc20_bulletin_board {
     use ink::prelude::string::String;
+    use ink::prelude::vec::Vec;
+    use ink::storage::Mapping;
+
+    #[cfg_attr(
+        feature = "std",
+        derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+    )]
+    #[derive(Debug, PartialEq, Eq, scale::Encode, scale::Decode)]
+    pub struct Bulletin {
+        from: AccountId,
+        content: String,
+        timestamp: Timestamp,
+        nonce: u128,
+    }
 
     /// A simple ERC-20 contract.
     #[ink(storage)]
@@ -16,6 +29,12 @@ mod erc20 {
         /// Mapping of the token amount which an account is allowed to withdraw
         /// from another account.
         allowances: Mapping<(AccountId, AccountId), Balance>,
+        /// Mapping from bulletin id to bulletin entity.
+        bulletins: Mapping<Hash, Bulletin>,
+        /// Mapping of bulletin vector which an account has post.
+        bulletin_ids: Mapping<AccountId, Vec<Hash>>,
+        /// Mapping of user's nonce.
+        nonce: Mapping<AccountId, u128>,
     }
 
     /// Event emitted when a token transfer occurs.
@@ -37,6 +56,16 @@ mod erc20 {
         #[ink(topic)]
         spender: AccountId,
         value: Balance,
+    }
+
+    #[ink(event)]
+    pub struct PostBulletin {
+        #[ink(topic)]
+        id: Hash,
+        #[ink(topic)]
+        from: AccountId,
+        content: String,
+        timestamp: Timestamp,
     }
 
     /// The ERC-20 error types.
@@ -68,24 +97,95 @@ mod erc20 {
                 total_supply,
                 balances,
                 allowances: Default::default(),
+                bulletins: Default::default(),
+                bulletin_ids: Default::default(),
+                nonce: Default::default(),
             }
         }
 
         #[ink(message)]
-        pub fn play_me(&self, a: String, b: String) -> String {
-            let c = Self::_play_me(a.as_str(), b.as_str());
-            //let c = Self::_playMe(a, b);
-            //println!("{:?}", c);
+        #[inline]
+        pub fn longer(&self, a: String, b: String) -> String {
+            let c = Self::_longer(a.as_str(), b.as_str());
             String::from(c)
         }
 
         #[inline]
-        fn _play_me<'a>(a: &'a str, b: &'a str) -> &'a str {
+        fn _longer<'a>(a: &'a str, b: &'a str) -> &'a str {
             if a.len() > b.len() {
                 a
             } else {
                 b
             }
+        }
+
+        /// Post bulletin to bulletin board.
+        #[ink(message)]
+        pub fn post_bulletin(&mut self, content: String) -> Hash {
+            use ink::{
+                env::hash::{Blake2x256, CryptoHash, HashOutput},
+                primitives::Clear,
+            };
+            use scale::Encode;
+
+            let from = self.env().caller();
+            let timestamp = self.env().block_timestamp();
+            let nonce = self.nonce.get(from).unwrap_or_default();
+            let blt = Bulletin { from, content, timestamp, nonce };
+    
+            self.nonce.insert(from, &(nonce + 1));
+
+            let mut id = Hash::CLEAR_HASH;
+            let len_id = id.as_ref().len();
+            let encoded = &blt.encode();
+            let mut hash_output = <<Blake2x256 as HashOutput>::Type as Default>::default();
+            <Blake2x256 as CryptoHash>::hash(&encoded, &mut hash_output);
+
+            let copy_len = core::cmp::min(hash_output.len(), len_id);
+
+            id.as_mut()[0..copy_len].copy_from_slice(&hash_output[0..copy_len]);
+
+            self.bulletins.insert(id, &blt);
+
+            let Some(mut ids) = self.bulletin_ids.get(from) else {
+                let mut ids = Vec::<Hash>::new();
+                ids.push(id);
+                self.bulletin_ids.insert(from, &ids);
+                return id;
+            };
+            ids.push(id);
+            self.bulletin_ids.insert(from, &ids);
+
+            Self::env().emit_event(PostBulletin {
+                id,
+                from,
+                content: blt.content,
+                timestamp,
+            });
+
+            id
+        }
+
+        /// Returns the bulletin of the specified `id`.
+        #[ink(message)]
+        pub fn get_bulletin(&self, id: Hash) -> Option<Bulletin> {
+            self.bulletins.get(id)
+        }
+
+        /// Returns the bulletins of the specified `from`.
+        #[ink(message)]
+        pub fn get_bulletins_by_from(&self, from: AccountId, limit: u16, offset: u16) -> Vec<Bulletin> {
+            let mut result = Vec::<Bulletin>::new();
+            let mut vec = self.bulletin_ids.get(from).unwrap();
+            let mut cnt = 0;
+            while let Some(top) = vec.pop() {
+                if cnt >= offset && cnt < offset + limit {
+                    let blt = self.bulletins.get(top).unwrap();
+                    result.push(blt);
+                }
+                cnt += 1;
+            }
+            result
         }
 
         /// Returns the total token supply.
@@ -193,7 +293,7 @@ mod erc20 {
             let caller = self.env().caller();
             let allowance = self.allowance_impl(&from, &caller);
             if allowance < value {
-                return Err(Error::InsufficientAllowance)
+                return Err(Error::InsufficientAllowance);
             }
             self.transfer_from_to(&from, &to, value)?;
             self.allowances
@@ -217,7 +317,7 @@ mod erc20 {
         ) -> Result<()> {
             let from_balance = self.balance_of_impl(from);
             if from_balance < value {
-                return Err(Error::InsufficientBalance)
+                return Err(Error::InsufficientBalance);
             }
 
             self.balances.insert(from, &(from_balance - value));
@@ -236,10 +336,7 @@ mod erc20 {
     mod tests {
         use super::*;
 
-        use ink::primitives::{
-            Clear,
-            Hash,
-        };
+        use ink::primitives::{Clear, Hash};
 
         type Event = <Erc20 as ::ink::reflect::ContractEventBase>::Type;
 
@@ -340,8 +437,7 @@ mod erc20 {
                 Some(AccountId::from([0x01; 32])),
                 100,
             );
-            let accounts =
-                ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
             // Alice owns all the tokens on contract instantiation
             assert_eq!(erc20.balance_of(accounts.alice), 100);
             // Bob does not owns tokens
@@ -353,8 +449,7 @@ mod erc20 {
             // Constructor works.
             let mut erc20 = Erc20::new(100);
             // Transfer event triggered during initial construction.
-            let accounts =
-                ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
 
             assert_eq!(erc20.balance_of(accounts.bob), 0);
             // Alice transfers 10 tokens to Bob.
@@ -384,8 +479,7 @@ mod erc20 {
         fn invalid_transfer_should_fail() {
             // Constructor works.
             let mut erc20 = Erc20::new(100);
-            let accounts =
-                ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
 
             assert_eq!(erc20.balance_of(accounts.bob), 0);
 
@@ -420,8 +514,7 @@ mod erc20 {
             // Constructor works.
             let mut erc20 = Erc20::new(100);
             // Transfer event triggered during initial construction.
-            let accounts =
-                ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
 
             // Bob fails to transfer tokens owned by Alice.
             assert_eq!(
@@ -469,8 +562,7 @@ mod erc20 {
         #[ink::test]
         fn allowance_must_not_change_on_failed_transfer() {
             let mut erc20 = Erc20::new(100);
-            let accounts =
-                ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
 
             // Alice approves Bob for token transfers on her behalf.
             let alice_balance = erc20.balance_of(accounts.alice);
@@ -501,10 +593,28 @@ mod erc20 {
         }
 
         #[ink::test]
-        fn play_me_works() {
+        fn longer_works() {
             let erc20 = Erc20::new(100);
-            let res = erc20.play_me(String::from("hahaha"), String::from("lalalalala"));
+            let res = erc20.longer(String::from("hahaha"), String::from("lalalalala"));
             assert_eq!(res, String::from("lalalalala"));
+        }
+
+        #[ink::test]
+        fn get_bulletins_by_from_works() {
+            let mut erc20 = Erc20::new(100);
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+            // Alice post buttetins.
+            erc20.post_bulletin(String::from("xmfyyds5"));
+            erc20.post_bulletin(String::from("xmfyyds4"));
+            erc20.post_bulletin(String::from("xmfyyds3"));
+            erc20.post_bulletin(String::from("xmfyyds2"));
+            erc20.post_bulletin(String::from("xmfyyds1"));
+            erc20.post_bulletin(String::from("xmfyyds0"));
+            // Get Alice's buttetins.
+            let res1 = erc20.get_bulletins_by_from(accounts.alice, 7, 2);
+            assert_eq!(res1.len(), 4);
+            let res2 = erc20.get_bulletins_by_from(accounts.alice, 3, 2);
+            assert_eq!(res2.len(), 3);
         }
 
         /// For calculating the event topic hash.
@@ -534,11 +644,7 @@ mod erc20 {
             T: scale::Encode,
         {
             use ink::{
-                env::hash::{
-                    Blake2x256,
-                    CryptoHash,
-                    HashOutput,
-                },
+                env::hash::{Blake2x256, CryptoHash, HashOutput},
                 primitives::Clear,
             };
 
@@ -548,10 +654,9 @@ mod erc20 {
             let len_encoded = encoded.len();
             if len_encoded <= len_result {
                 result.as_mut()[..len_encoded].copy_from_slice(&encoded);
-                return result
+                return result;
             }
-            let mut hash_output =
-                <<Blake2x256 as HashOutput>::Type as Default>::default();
+            let mut hash_output = <<Blake2x256 as HashOutput>::Type as Default>::default();
             <Blake2x256 as CryptoHash>::hash(&encoded, &mut hash_output);
             let copy_len = core::cmp::min(hash_output.len(), len_result);
             result.as_mut()[0..copy_len].copy_from_slice(&hash_output[0..copy_len]);
@@ -626,14 +731,9 @@ mod erc20 {
             let charlie_account = ink_e2e::account_id(ink_e2e::AccountKeyring::Charlie);
 
             let amount = 500_000_000u128;
-            let transfer_from =
-                build_message::<Erc20Ref>(contract_acc_id.clone()).call(|erc20| {
-                    erc20.transfer_from(
-                        bob_account.clone(),
-                        charlie_account.clone(),
-                        amount,
-                    )
-                });
+            let transfer_from = build_message::<Erc20Ref>(contract_acc_id.clone()).call(|erc20| {
+                erc20.transfer_from(bob_account.clone(), charlie_account.clone(), amount)
+            });
             let transfer_from_result = client
                 .call(&ink_e2e::charlie(), transfer_from, 0, None)
                 .await;
@@ -653,14 +753,9 @@ mod erc20 {
                 .expect("approve failed");
 
             // `transfer_from` the approved amount
-            let transfer_from =
-                build_message::<Erc20Ref>(contract_acc_id.clone()).call(|erc20| {
-                    erc20.transfer_from(
-                        bob_account.clone(),
-                        charlie_account.clone(),
-                        approved_value,
-                    )
-                });
+            let transfer_from = build_message::<Erc20Ref>(contract_acc_id.clone()).call(|erc20| {
+                erc20.transfer_from(bob_account.clone(), charlie_account.clone(), approved_value)
+            });
             let transfer_from_result = client
                 .call(&ink_e2e::charlie(), transfer_from, 0, None)
                 .await;
@@ -676,10 +771,8 @@ mod erc20 {
                 .await;
 
             // `transfer_from` again, this time exceeding the approved amount
-            let transfer_from =
-                build_message::<Erc20Ref>(contract_acc_id.clone()).call(|erc20| {
-                    erc20.transfer_from(bob_account.clone(), charlie_account.clone(), 1)
-                });
+            let transfer_from = build_message::<Erc20Ref>(contract_acc_id.clone())
+                .call(|erc20| erc20.transfer_from(bob_account.clone(), charlie_account.clone(), 1));
             let transfer_from_result = client
                 .call(&ink_e2e::charlie(), transfer_from, 0, None)
                 .await;
@@ -698,34 +791,3 @@ mod erc20 {
         }
     }
 }
-
-/*
-/// 不能放两个 contract
-#[ink::contract]
-mod myContract {
-    #[ink(storage)]
-    #[derive(Default)]
-    pub struct MyContract {
-        value: bool,
-    }
-
-    impl MyContract {
-        #[ink(constructor)]
-        pub fn new(initial_value: bool) -> Self {
-            Self {
-                value: initial_value,
-            }
-        }
-
-        #[ink(message)]
-        pub fn get(&self) -> bool {
-            self.value
-        }
-
-        #[ink(message)]
-        pub fn set(&mut self, _value: bool) {
-            self.value = _value;
-        }
-    }
-}
-*/
