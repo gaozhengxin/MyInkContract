@@ -66,6 +66,7 @@ mod erc20_bulletin_board {
         from: AccountId,
         content: String,
         timestamp: Timestamp,
+        nonce: u128,
     }
 
     /// The ERC-20 error types.
@@ -161,6 +162,7 @@ mod erc20_bulletin_board {
                 from,
                 content: blt.content,
                 timestamp,
+                nonce: nonce + 1,
             });
 
             id
